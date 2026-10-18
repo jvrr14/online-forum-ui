@@ -1,8 +1,8 @@
-import { useEffect, useState } from "react";
+import { useEffect, useOptimistic, useState, useTransition } from "react";
 import { Link, useSearchParams } from "react-router";
 import { postsApi } from "../../api/posts";
 import { useAppSelector } from "../../store/hooks";
-import { selectIsAuthenticated } from "../auth/authSlice";
+import { selectIsAuthenticated, selectUser } from "../auth/authSlice";
 import { Icon } from "../../components/Icon";
 import { APP_NAME } from "../../lib/brand";
 import type { PostsFetchState } from "./types";
@@ -22,14 +22,31 @@ function parsePage(value: string | null): number {
   return Number.isInteger(page) && page >= 1 ? page : 1;
 }
 
+// Returns the fetch state with one post removed and the total lowered by one.
+function withoutPost(
+  state: PostsFetchState | null,
+  id: number,
+): PostsFetchState | null {
+  if (state?.status !== "success") return state;
+  return {
+    ...state,
+    data: {
+      data: state.data.data.filter((post) => post.id !== id),
+      meta: { ...state.data.meta, total: state.data.meta.total - 1 },
+    },
+  };
+}
+
 const dateFormat = new Intl.DateTimeFormat(undefined, { dateStyle: "medium" });
 
 export function PostsPage() {
   const isAuthenticated = useAppSelector(selectIsAuthenticated);
+  const user = useAppSelector(selectUser);
   const [searchParams, setSearchParams] = useSearchParams();
   const page = parsePage(searchParams.get("page"));
   const search = searchParams.get("q")?.trim() ?? "";
   const [attempt, setAttempt] = useState(0);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const [state, setState] = useState<PostsFetchState | null>(null);
   const key = JSON.stringify([page, search, attempt]);
 
@@ -47,6 +64,41 @@ export function PostsPage() {
 
   const current = state?.key === key ? state : null;
   const totalPages = current?.status === "success" ? current.data.meta.totalPages : 1;
+
+  const posts = current?.status === "success" ? current.data.data : [];
+  const [isPending, startTransition] = useTransition();
+
+  const [visiblePosts, removeOptimistic] = useOptimistic(
+    posts,
+    (current, deletedId: number) =>
+      current.filter((post) => post.id !== deletedId),
+  );
+
+  // The author or an admin may delete a post (the API enforces this too).
+  function canDelete(authorId: number) {
+    return user !== null && (user.id === authorId || user.role === "ADMIN");
+  }
+
+  function handleDelete(id: number) {
+    if (!window.confirm("Delete this discussion? This can't be undone."))
+      return;
+
+    setDeleteError(null);
+    startTransition(async () => {
+      removeOptimistic(id);
+      try {
+        await postsApi.delete(id);
+        // Updates after an `await` are no longer part of the transition,
+        // so wrap this one or the post flashes back before the state commits.
+        startTransition(() => setState((prev) => withoutPost(prev, id)));
+      } catch (err) {
+        // The optimistic removal reverts by itself when the transition ends.
+        setDeleteError(
+          err instanceof Error ? err.message : "Couldn't delete the post",
+        );
+      }
+    });
+  }
 
   function goToPage(next: number) {
     const params = new URLSearchParams(searchParams);
@@ -85,7 +137,12 @@ export function PostsPage() {
           <div className="mb-1 flex min-h-11 items-start justify-between gap-4 border-b border-line">
             <h2 className="flex min-w-0 items-center gap-2 text-sm font-semibold">
               {search ? "Search results" : "All discussions"}
-              {current?.status === "success" && <span className="rounded bg-brand-soft px-2 py-0.5 text-xs font-medium text-brand">{current.data.meta.total}</span>}
+              {current?.status === "success" && (
+                <span className="rounded bg-brand-soft px-2 py-0.5 text-xs font-medium text-brand">
+                  {current.data.meta.total -
+                    (posts.length - visiblePosts.length)}
+                </span>
+              )}
             </h2>
             {search && <Link to="/" className="-mt-3 inline-flex min-h-11 shrink-0 items-center text-sm text-muted hover:text-brand">Clear search</Link>}
           </div>
@@ -98,37 +155,133 @@ export function PostsPage() {
             <button type="button" className="button button-secondary mt-5" onClick={() => setAttempt((n) => n + 1)}>Try again</button>
           </div>}
 
-          {current?.status === "success" && <>
-            {current.data.data.length === 0 ? <div className="py-14 text-center">
-              <Icon name="message" width="28" height="28" className="mx-auto mb-4 text-muted" />
-              <h3 className="font-semibold">{search ? "No matching discussions" : page > 1 ? "No posts on this page" : "Be the first to start a conversation"}</h3>
-              <p className="mt-2 text-sm text-muted">{search ? "Try a different keyword, or clear your search." : "Ask a question or share an idea to get things going."}</p>
-              {!search && isAuthenticated && <Link to="/posts/new" className="button button-primary mt-5"><Icon name="plus" />Create a post</Link>}
-            </div> : <ul className="divide-y divide-line">
-              {current.data.data.map((post) => <li key={post.id}>
-                <article className="group -mx-3 flex gap-3 rounded-lg px-3 py-5 transition-colors hover:bg-white sm:-mx-4 sm:gap-4 sm:px-4 sm:py-6">
-                  <div aria-hidden="true" className="mt-0.5 flex size-9 shrink-0 items-center justify-center rounded-full border border-brand/10 bg-brand-soft text-xs font-semibold text-brand sm:size-10 sm:text-sm">{post.author.username.slice(0, 2).toUpperCase()}</div>
-                  <div className="min-w-0 flex-1">
-                    <div className="mb-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted">
-                      <span className="max-w-full wrap-anywhere font-medium text-ink">{post.author.username}</span>
-                      <span aria-hidden="true">·</span>
-                      <time dateTime={post.createdAt}>{dateFormat.format(new Date(post.createdAt))}</time>
-                    </div>
-                    <h3 className="text-lg leading-snug font-semibold tracking-[-0.02em] sm:text-xl">
-                      <Link to={`/posts/${post.id}`} className="wrap-anywhere transition-colors hover:text-brand">{post.title}</Link>
-                    </h3>
-                    {post.content && <p className="mt-2 wrap-anywhere text-sm leading-6 text-muted">{excerpt(post.content)}</p>}
-                    <div className="mt-3 flex items-center gap-1.5 text-xs text-muted sm:mt-4"><Icon name="eye" width="15" height="15" />{post.views.toLocaleString()} {post.views === 1 ? "view" : "views"}</div>
-                  </div>
-                </article>
-              </li>)}
-            </ul>}
-            {totalPages > 1 && <nav aria-label="Pagination" className="mt-6 flex items-center justify-between gap-2 border-t border-line pt-5">
-              <button type="button" className="button button-secondary px-3" onClick={() => goToPage(page - 1)} disabled={page <= 1}><Icon name="chevron-left" />Previous</button>
-              <span className="text-center text-xs text-muted" aria-live="polite">Page {page} of {totalPages}</span>
-              <button type="button" className="button button-secondary px-3" onClick={() => goToPage(page + 1)} disabled={page >= totalPages}>Next<Icon name="chevron-right" /></button>
-            </nav>}
-          </>}
+          {deleteError && (
+            <p role="alert" className="form-error mt-5">
+              {deleteError}
+            </p>
+          )}
+
+          {current?.status === "success" && (
+            <>
+              {visiblePosts.length === 0 ? (
+                <div className="py-14 text-center">
+                  <Icon
+                    name="message"
+                    width="28"
+                    height="28"
+                    className="mx-auto mb-4 text-muted"
+                  />
+                  <h3 className="font-semibold">
+                    {search
+                      ? "No matching discussions"
+                      : page > 1
+                        ? "No posts on this page"
+                        : "Be the first to start a conversation"}
+                  </h3>
+                  <p className="mt-2 text-sm text-muted">
+                    {search
+                      ? "Try a different keyword, or clear your search."
+                      : "Ask a question or share an idea to get things going."}
+                  </p>
+                  {!search && isAuthenticated && (
+                    <Link
+                      to="/posts/new"
+                      className="button button-primary mt-5"
+                    >
+                      <Icon name="plus" />
+                      Create a post
+                    </Link>
+                  )}
+                </div>
+              ) : (
+                <ul className="divide-y divide-line">
+                  {visiblePosts.map((post) => (
+                    <li key={post.id}>
+                      <article className="group -mx-3 flex gap-3 rounded-lg px-3 py-5 transition-colors hover:bg-white sm:-mx-4 sm:gap-4 sm:px-4 sm:py-6">
+                        <div
+                          aria-hidden="true"
+                          className="mt-0.5 flex size-9 shrink-0 items-center justify-center rounded-full border border-brand/10 bg-brand-soft text-xs font-semibold text-brand sm:size-10 sm:text-sm"
+                        >
+                          {post.author.username.slice(0, 2).toUpperCase()}
+                        </div>
+                        <div className="min-w-0 flex-1">
+                          <div className="mb-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted">
+                            <span className="max-w-full wrap-anywhere font-medium text-ink">
+                              {post.author.username}
+                            </span>
+                            <span aria-hidden="true">·</span>
+                            <time dateTime={post.createdAt}>
+                              {dateFormat.format(new Date(post.createdAt))}
+                            </time>
+                          </div>
+                          <h3 className="text-lg leading-snug font-semibold tracking-[-0.02em] sm:text-xl">
+                            <Link
+                              to={`/posts/${post.id}`}
+                              className="wrap-anywhere transition-colors hover:text-brand"
+                            >
+                              {post.title}
+                            </Link>
+                          </h3>
+                          {post.content && (
+                            <p className="mt-2 wrap-anywhere text-sm leading-6 text-muted">
+                              {excerpt(post.content)}
+                            </p>
+                          )}
+                          <div className="mt-3 flex items-center gap-1.5 text-xs text-muted sm:mt-4">
+                            <Icon name="eye" width="15" height="15" />
+                            {post.views.toLocaleString()}{" "}
+                            {post.views === 1 ? "view" : "views"}
+                            {canDelete(post.authorId) && (
+                              <button
+                                type="button"
+                                className="ml-auto min-h-9 rounded px-2 text-xs font-medium text-red-700 transition-colors hover:bg-red-50 disabled:opacity-50 disabled:hover:bg-transparent"
+                                aria-label={`Delete discussion: ${post.title}`}
+                                onClick={() => handleDelete(post.id)}
+                                disabled={isPending}
+                              >
+                                Delete
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      </article>
+                    </li>
+                  ))}
+                </ul>
+              )}
+              {totalPages > 1 && (
+                <nav
+                  aria-label="Pagination"
+                  className="mt-6 flex items-center justify-between gap-2 border-t border-line pt-5"
+                >
+                  <button
+                    type="button"
+                    className="button button-secondary px-3"
+                    onClick={() => goToPage(page - 1)}
+                    disabled={page <= 1}
+                  >
+                    <Icon name="chevron-left" />
+                    Previous
+                  </button>
+                  <span
+                    className="text-center text-xs text-muted"
+                    aria-live="polite"
+                  >
+                    Page {page} of {totalPages}
+                  </span>
+                  <button
+                    type="button"
+                    className="button button-secondary px-3"
+                    onClick={() => goToPage(page + 1)}
+                    disabled={page >= totalPages}
+                  >
+                    Next
+                    <Icon name="chevron-right" />
+                  </button>
+                </nav>
+              )}
+            </>
+          )}
         </section>
 
         <aside aria-label="About the community" className="space-y-7 border-t border-line pt-7 lg:border-0 lg:pt-0">
